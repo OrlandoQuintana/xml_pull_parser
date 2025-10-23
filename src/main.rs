@@ -5,6 +5,13 @@ use rand::prelude::*;
 use rand::thread_rng;
 
 #[derive(Debug, Clone, Default)]
+struct Reading {
+    timestamp: Option<String>,
+    sensor: Option<String>,
+    value: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default)]
 struct Record {
     id: Option<Vec<i32>>,
     name: Option<Vec<String>>,
@@ -13,7 +20,7 @@ struct Record {
     tags: Option<Vec<String>>,
     meta_created: Option<Vec<String>>,
     meta_updated: Option<Vec<String>>,
-    measurements: Option<Vec<f64>>,
+    readings: Option<Vec<Reading>>, // NEW nested subrecords
 }
 
 #[derive(Debug, Clone)]
@@ -25,7 +32,9 @@ struct FlatRecord {
     tag: Option<String>,
     meta_created: Option<String>,
     meta_updated: Option<String>,
-    measurement: Option<f64>,
+    reading_timestamp: Option<String>,
+    reading_sensor: Option<String>,
+    reading_value: Option<f64>,
 }
 
 impl Record {
@@ -37,7 +46,6 @@ impl Record {
     }
 
     fn insert_text(&mut self, path: &[String], text: &str) {
-        // strip root "records" if present
         let joined = if path.first().map(|s| s == "records").unwrap_or(false) {
             path[1..].join(".")
         } else {
@@ -45,6 +53,7 @@ impl Record {
         };
 
         match joined.as_str() {
+            // --- top-level fields ---
             "record.id" => {
                 if let Ok(v) = text.trim().parse::<i32>() {
                     Self::push(&mut self.id, v);
@@ -60,21 +69,41 @@ impl Record {
             "record.tags.tag" => Self::push(&mut self.tags, text.trim().to_string()),
             "record.meta.created" => Self::push(&mut self.meta_created, text.trim().to_string()),
             "record.meta.updated" => Self::push(&mut self.meta_updated, text.trim().to_string()),
-            "record.measurements.experiment.trial.sensor.reading" => {
-                if let Ok(v) = text.trim().parse::<f64>() {
-                    Self::push(&mut self.measurements, v);
+
+            // --- nested reading elements ---
+            "record.readings.reading.timestamp" => {
+                if let Some(vec) = self.readings.as_mut() {
+                    if let Some(last) = vec.last_mut() {
+                        last.timestamp = Some(text.trim().to_string());
+                    }
                 }
             }
+            "record.readings.reading.sensor" => {
+                if let Some(vec) = self.readings.as_mut() {
+                    if let Some(last) = vec.last_mut() {
+                        last.sensor = Some(text.trim().to_string());
+                    }
+                }
+            }
+            "record.readings.reading.value" => {
+                if let Ok(v) = text.trim().parse::<f64>() {
+                    if let Some(vec) = self.readings.as_mut() {
+                        if let Some(last) = vec.last_mut() {
+                            last.value = Some(v);
+                        }
+                    }
+                }
+            }
+
             _ => {}
         }
     }
 
     fn flatten(&self) -> Vec<FlatRecord> {
-        let ids = self.id.as_ref().map(|v| v.clone()).unwrap_or_else(|| vec![i32::default()]);
-        let tags = self.tags.as_ref().map(|v| v.clone()).unwrap_or_else(|| vec![String::default()]);
-        let measurements = self.measurements.as_ref().map(|v| v.clone()).unwrap_or_else(|| vec![f64::default()]);
+        let ids = self.id.clone().unwrap_or_else(|| vec![i32::default()]);
+        let tags = self.tags.clone().unwrap_or_else(|| vec![String::default()]);
+        let readings = self.readings.clone().unwrap_or_else(|| vec![Reading::default()]);
 
-        // Scalars remain fixed
         let name = self.name.as_ref().and_then(|v| v.first().cloned());
         let value = self.value.as_ref().and_then(|v| v.first().copied());
         let category = self.category.as_ref().and_then(|v| v.first().cloned());
@@ -83,10 +112,10 @@ impl Record {
 
         let mut rows = Vec::new();
 
-        // Triple nested product of ids × tags × measurements
+        // Cartesian product of id × tag × reading
         for id in &ids {
             for tag in &tags {
-                for measurement in &measurements {
+                for reading in &readings {
                     rows.push(FlatRecord {
                         id: Some(*id),
                         name: name.clone(),
@@ -95,13 +124,14 @@ impl Record {
                         tag: Some(tag.clone()),
                         meta_created: meta_created.clone(),
                         meta_updated: meta_updated.clone(),
-                        measurement: Some(*measurement),
+                        reading_timestamp: reading.timestamp.clone(),
+                        reading_sensor: reading.sensor.clone(),
+                        reading_value: reading.value,
                     });
                 }
             }
         }
 
-        // Edge case: no lists at all, yield one row
         if rows.is_empty() {
             rows.push(FlatRecord {
                 id: None,
@@ -111,7 +141,9 @@ impl Record {
                 tag: None,
                 meta_created,
                 meta_updated,
-                measurement: None,
+                reading_timestamp: None,
+                reading_sensor: None,
+                reading_value: None,
             });
         }
 
@@ -134,9 +166,14 @@ fn parse_records(xml: &str) -> Vec<Record> {
             Ok(Event::Start(e)) => {
                 let name = str::from_utf8(e.name().as_ref()).unwrap().to_string();
                 path.push(name.clone());
+
                 if name == "record" {
                     inside_record = true;
                     current = Record::default();
+                }
+
+                if inside_record && name == "reading" {
+                    current.readings.get_or_insert_with(Vec::new).push(Reading::default());
                 }
             }
             Ok(Event::Text(e)) => {
@@ -147,10 +184,12 @@ fn parse_records(xml: &str) -> Vec<Record> {
             }
             Ok(Event::End(e)) => {
                 let name = str::from_utf8(e.name().as_ref()).unwrap().to_string();
+
                 if name == "record" {
                     records.push(current.clone());
                     inside_record = false;
                 }
+
                 path.pop();
             }
             Ok(Event::Eof) => break,
@@ -159,6 +198,7 @@ fn parse_records(xml: &str) -> Vec<Record> {
         }
         buf.clear();
     }
+
     records
 }
 
@@ -167,7 +207,7 @@ fn main() {
     let records = parse_records(&xml);
     println!("Parsed {} records", records.len());
 
-    for (i, rec) in records.iter().enumerate() { // print first few
+    for (i, rec) in records.iter().enumerate() {
         println!("\nRecord {}:\n{:#?}", i, rec);
         for row in rec.flatten().iter() {
             println!("  {:?}", row);
@@ -175,7 +215,7 @@ fn main() {
     }
 }
 
-/// Generate large XML with varied content and missing fields + nested measurements
+/// Generate large XML with nested `<readings>` structures
 fn big_xml() -> String {
     let mut rng = thread_rng();
     let all_tags = [
@@ -185,7 +225,7 @@ fn big_xml() -> String {
 
     let mut xml = String::from("<records>\n");
 
-    for i in 0..10000 {
+    for i in 0..1000 {
         let name = if rng.gen_bool(0.9) {
             format!("<name>Alpha{}</name>", i)
         } else {
@@ -209,8 +249,7 @@ fn big_xml() -> String {
             String::new()
         };
 
-        // Random 0–5 tags
-        let tag_count = rng.gen_range(0..=5);
+        let tag_count = rng.gen_range(0..=4);
         let mut tag_block = String::new();
         if tag_count > 0 {
             tag_block.push_str("<tags>\n");
@@ -221,37 +260,28 @@ fn big_xml() -> String {
             tag_block.push_str("</tags>\n");
         }
 
-        // Deep nested measurements: experiment → trial → sensor → reading
-        let mut measurements = String::new();
-        if rng.gen_bool(0.7) {
-            measurements.push_str("<measurements>\n");
-            let exp_count = rng.gen_range(1..=3);
-            for _ in 0..exp_count {
-                measurements.push_str("  <experiment>\n");
-                let trial_count = rng.gen_range(1..=3);
-                for _ in 0..trial_count {
-                    measurements.push_str("    <trial>\n");
-                    let sensor_count = rng.gen_range(1..=2);
-                    for _ in 0..sensor_count {
-                        measurements.push_str("      <sensor>\n");
-                        let reading_count = rng.gen_range(1..=4);
-                        for _ in 0..reading_count {
-                            let reading: f64 = rng.gen_range(10.0..100.0);
-                            measurements.push_str(&format!(
-                                "        <reading>{:.2}</reading>\n",
-                                reading
-                            ));
-                        }
-                        measurements.push_str("      </sensor>\n");
-                    }
-                    measurements.push_str("    </trial>\n");
-                }
-                measurements.push_str("  </experiment>\n");
+        // --- NEW nested readings ---
+        let mut readings = String::new();
+        if rng.gen_bool(0.8) {
+            readings.push_str("<readings>\n");
+            let reading_count = rng.gen_range(1..=3);
+            for _ in 0..reading_count {
+                let sensor = if rng.gen_bool(0.5) { "temp" } else { "pressure" };
+                let val: f64 = rng.gen_range(10.0..100.0);
+                readings.push_str(&format!(
+                    "  <reading>\
+                         <timestamp>2025-10-{:02}</timestamp>\
+                         <sensor>{}</sensor>\
+                         <value>{:.2}</value>\
+                       </reading>\n",
+                    rng.gen_range(1..=30),
+                    sensor,
+                    val
+                ));
             }
-            measurements.push_str("</measurements>\n");
+            readings.push_str("</readings>\n");
         }
 
-        // IDs
         let id1 = 1000 + i;
         let id2 = 2000 + i;
         let ids = if rng.gen_bool(0.7) {
@@ -260,7 +290,6 @@ fn big_xml() -> String {
             format!("<id>{}</id>", id1)
         };
 
-        // Meta
         let created = if rng.gen_bool(0.9) { "<created>2025-10-23</created>" } else { "" };
         let updated = if rng.gen_bool(0.8) { "<updated>2025-10-24</updated>" } else { "" };
         let meta = if !created.is_empty() || !updated.is_empty() {
@@ -281,7 +310,7 @@ fn big_xml() -> String {
             {}
         </record>
         "#,
-            ids, name, value, category, tag_block, measurements, meta
+            ids, name, value, category, tag_block, readings, meta
         ));
     }
 
