@@ -1,3 +1,126 @@
+struct Business {
+    revenue: Option<f64>,
+    outlook: Option<String>
+}
+
+impl Business {
+    fn flatten(&self) -> Vec<FlatRecord> {
+        vec![FlatRecord {
+            business_revenue: self.revenue,
+            business_outlook: self.outlook.clone(),
+            ..Default::default()
+        }]
+    }
+}
+
+struct History {
+    previous: Option<String>,
+    trend: Option<String>
+}
+
+impl History {
+    fn flatten(&self) -> Vec<FlatRecord> {
+        vec![FlatRecord {
+            history_previous: self.previous.clone(),
+            history_trend: self.trend.clone(),
+            ..Default::default()
+        }]
+    }
+}
+
+struct Physics {
+    velocity: Option<f64>,
+    acceleration: Option<f64>,
+    mass: Option<f64>
+}
+    
+impl Physics {
+    fn flatten(&self) -> Vec<FlatRecord> {
+        vec![FlatRecord {
+            physics_velocity: self.velocity,
+            physics_acceleration: self.acceleration,
+            physics_mass: self.mass,
+            ..Default::default()
+        }]
+    }
+}
+
+
+struct Stat { 
+    mean: Option<u64>,
+    mode: Option<u64>,
+    range: Option<u64>,
+    physics: Option<Vec<Physics>>,
+    history: Option<Vec<History>>,
+    business: Option<Vec<Business>>
+}
+
+
+impl Stat {
+    fn flatten(&self) -> Vec<FlatRecord> {
+        // Unwrap child lists or fall back to empty Vecs
+        let physics = self.physics.clone().unwrap_or_default();
+        let history = self.history.clone().unwrap_or_default();
+        let business = self.business.clone().unwrap_or_default();
+
+        // Flatten each list to Vec<FlatRecord>
+        let flat_physics: Vec<FlatRecord> = if physics.is_empty() {
+            vec![FlatRecord::default()]
+        } else {
+            physics.into_iter().flat_map(|p| p.flatten()).collect()
+        };
+
+        let flat_history: Vec<FlatRecord> = if history.is_empty() {
+            vec![FlatRecord::default()]
+        } else {
+            history.into_iter().flat_map(|h| h.flatten()).collect()
+        };
+
+        let flat_business: Vec<FlatRecord> = if business.is_empty() {
+            vec![FlatRecord::default()]
+        } else {
+            business.into_iter().flat_map(|b| b.flatten()).collect()
+        };
+
+        // Cartesian join: physics × history × business
+        let mut out = Vec::new();
+        for p in &flat_physics {
+            for h in &flat_history {
+                for b in &flat_business {
+                    let mut row = FlatRecord::default();
+
+                    // Copy Stat-level scalar fields
+                    row.stat_mean = self.mean;
+                    row.stat_mode = self.mode;
+                    row.stat_range = self.range;
+
+                    // Merge flattened Physics
+                    row.physics_velocity = p.physics_velocity;
+                    row.physics_acceleration = p.physics_acceleration;
+                    row.physics_mass = p.physics_mass;
+
+                    // Merge flattened History
+                    row.history_previous = h.history_previous.clone();
+                    row.history_trend = h.history_trend.clone();
+
+                    // Merge flattened Business
+                    row.business_revenue = b.business_revenue;
+                    row.business_outlook = b.business_outlook.clone();
+
+                    out.push(row);
+                }
+            }
+        }
+
+        // Fallback: if no data at all
+        if out.is_empty() {
+            out.push(FlatRecord::default());
+        }
+
+        out
+    }
+}
+
 struct RegionID {
     region_hash: Option<String>,
     region_id: Option<String>,
@@ -266,7 +389,8 @@ struct Record {
     meta_updated: Option<Vec<String>>,
     readings: Option<Vec<Reading>>,
     measurements: Option<Vec<Measurement>>,
-    locations: Option<Vec<Location>>
+    locations: Option<Vec<Location>>,
+    statistics: Option<Vec<Stat>>
 }
 
 impl Record {
@@ -291,7 +415,7 @@ impl Record {
         let readings = self.readings.clone().unwrap_or_default();
         let measurements = self.measurements.clone().unwrap_or_default();
         let locations = self.locations.clone().unwrap_or_default();
-
+        let statistics = self.statistics.clone().unwrap_or_default();
         // ─────────────────────────────────────────────────────────────
         //  FALLBACKS FOR EMPTY VECTORS
         // ─────────────────────────────────────────────────────────────
@@ -326,6 +450,12 @@ impl Record {
         } else {
             locations.into_iter().flat_map(|l| l.flatten()).collect()
         };
+        
+        let flat_statistics: Vec<FlatRecord> = if statistics.is_empty() {
+            vec![FlatRecord::default()]
+        } else {
+            statistics.into_iter().flat_map(|s| s.flatten()).collect()
+        };
 
         // ─────────────────────────────────────────────────────────────
         //  CARTESIAN PRODUCT ACROSS ALL COMBINATIONS
@@ -348,42 +478,49 @@ impl Record {
                                 for meta_updated in &meta_updateds {
                                     for reading in &flat_readings {
                                         for measurement in &flat_measurements {
-                                            for location in &flat_locations {
-                                                // Start with a fresh flat record
-                                                let mut row = FlatRecord::default();
-
-                                                // Fill top-level Record fields
-                                                row.id = Some(*id);
-                                                row.name = Some(name.clone());
-                                                row.value = Some(*value);
-                                                row.category = Some(category.clone());
-                                                row.tag = Some(tag.clone());
-                                                row.meta_created = Some(meta_created.clone());
-                                                row.meta_updated = Some(meta_updated.clone());
-
-                                                // Merge flattened Reading
-                                                row.reading_timestamp = reading.reading_timestamp.clone();
-                                                row.reading_sensor = reading.reading_sensor.clone();
-                                                row.reading_value = reading.reading_value;
-
-                                                // Merge flattened Measurement + Method
-                                                row.measurement_type = measurement.measurement_type.clone();
-                                                row.measurement_data = measurement.measurement_data.clone();
-                                                row.method_max = measurement.method_max;
-                                                row.method_min = measurement.method_min;
-                                                row.method_hash = measurement.method_hash;
-
-                                                // Merge flattened Location + Region + RegionID
-                                                row.lat = location.lat;
-                                                row.lon = location.lon;
-                                                row.h3_cell = location.h3_cell.clone();
-                                                row.country_code = location.country_code.clone();
-                                                row.region_hash = location.region_hash.clone();
-                                                row.region_id = location.region_id.clone();
-
-                                                // Push the complete Cartesian row
-                                                rows.push(row);
-                                            }
+                                             for location in &flat_locations {
+                                                for statistic in &flat_statistics {
+                                                    let mut row = FlatRecord::default();
+                                            
+                                                    // Fill Record-level fields...
+                                                    row.id = Some(*id);
+                                                    // (etc...)
+                                            
+                                                    // Merge flattened Reading
+                                                    row.reading_timestamp = reading.reading_timestamp.clone();
+                                                    row.reading_sensor = reading.reading_sensor.clone();
+                                                    row.reading_value = reading.reading_value;
+                                            
+                                                    // Merge flattened Measurement + Method
+                                                    row.measurement_type = measurement.measurement_type.clone();
+                                                    row.measurement_data = measurement.measurement_data.clone();
+                                                    row.method_max = measurement.method_max;
+                                                    row.method_min = measurement.method_min;
+                                                    row.method_hash = measurement.method_hash;
+                                            
+                                                    // Merge flattened Location + Region + RegionID
+                                                    row.lat = location.lat;
+                                                    row.lon = location.lon;
+                                                    row.h3_cell = location.h3_cell.clone();
+                                                    row.country_code = location.country_code.clone();
+                                                    row.region_hash = location.region_hash.clone();
+                                                    row.region_id = location.region_id.clone();
+                                            
+                                                    // 🆕 Merge flattened Statistics
+                                                    row.stat_mean = statistic.stat_mean;
+                                                    row.stat_mode = statistic.stat_mode;
+                                                    row.stat_range = statistic.stat_range;
+                                                    row.physics_velocity = statistic.physics_velocity;
+                                                    row.physics_acceleration = statistic.physics_acceleration;
+                                                    row.physics_mass = statistic.physics_mass;
+                                                    row.history_previous = statistic.history_previous.clone();
+                                                    row.history_trend = statistic.history_trend.clone();
+                                                    row.business_revenue = statistic.business_revenue;
+                                                    row.business_outlook = statistic.business_outlook.clone();
+                                            
+                                                    rows.push(row);
+                                                }
+}
                                         }
                                     }
                                 }
@@ -438,4 +575,19 @@ struct FlatRecord {
     country_code: Option<String>,
     region_hash: Option<String>,
     region_id: Option<String>,
+    
+    // Flattened Stat + Physics + History + Business
+    stat_mean: Option<u64>,
+    stat_mode: Option<u64>,
+    stat_range: Option<u64>,
+    
+    physics_velocity: Option<f64>,
+    physics_acceleration: Option<f64>,
+    physics_mass: Option<f64>,
+    
+    history_previous: Option<String>,
+    history_trend: Option<String>,
+    
+    business_revenue: Option<f64>,
+    business_outlook: Option<String>
 }
