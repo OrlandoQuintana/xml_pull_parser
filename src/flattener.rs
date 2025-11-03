@@ -2,15 +2,16 @@ use std::fmt;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::time::Instant;
-use crossbeam::channel;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use rand::Rng;
-use ahash::AHashMap;
-use std::thread;
 use std::sync::Arc;
 use dashmap::DashMap;
+use arrow::array::*;
+use arrow::datatypes::*;
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::file::properties::WriterProperties;
+use std::fs::File;
 
 #[derive(Debug, Clone, Default)]
 struct Business {
@@ -554,14 +555,138 @@ impl fmt::Display for FlatRecord {
     }
 }
 
+fn to_arrow(rows: &[FlatRecord]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("value", DataType::UInt64, true),
+        Field::new("category", DataType::Utf8, true),
+        Field::new("tag", DataType::Utf8, true),
+        Field::new("meta_created", DataType::Utf8, true),
+        Field::new("meta_updated", DataType::Utf8, true),
+
+        Field::new("reading_timestamp", DataType::Utf8, true),
+        Field::new("reading_sensor", DataType::Utf8, true),
+        Field::new("reading_value", DataType::Float64, true),
+
+        Field::new("measurement_type", DataType::Utf8, true),
+        Field::new("measurement_data", DataType::Utf8, true),
+        Field::new("method_max", DataType::UInt64, true),
+        Field::new("method_min", DataType::UInt64, true),
+        Field::new("method_hash", DataType::Float64, true),
+
+        Field::new("lat", DataType::Float64, true),
+        Field::new("lon", DataType::Float64, true),
+        Field::new("h3_cell", DataType::Utf8, true),
+        Field::new("country_code", DataType::Utf8, true),
+        Field::new("region_hash", DataType::Utf8, true),
+        Field::new("region_id", DataType::Utf8, true),
+
+        Field::new("stat_mean", DataType::UInt64, true),
+        Field::new("stat_mode", DataType::UInt64, true),
+        Field::new("stat_range", DataType::UInt64, true),
+
+        Field::new("physics_velocity", DataType::Float64, true),
+        Field::new("physics_acceleration", DataType::Float64, true),
+        Field::new("physics_mass", DataType::Float64, true),
+
+        Field::new("history_previous", DataType::Utf8, true),
+        Field::new("history_trend", DataType::Utf8, true),
+
+        Field::new("business_revenue", DataType::Float64, true),
+        Field::new("business_outlook", DataType::Utf8, true),
+    ]));
+
+    // --- Helper macro for string columns ---
+    macro_rules! build_string {
+        ($name:ident) => {{
+            let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 8);
+            for r in rows {
+                match &r.$name {
+                    Some(v) => b.append_value(v),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish()) as ArrayRef
+        }};
+    }
+
+    // --- Helper macro for numeric columns ---
+    macro_rules! build_prim {
+        ($name:ident, $builder:ty) => {{
+            let mut b = <$builder>::with_capacity(rows.len());
+            for r in rows {
+                match r.$name {
+                    Some(v) => b.append_value(v),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish()) as ArrayRef
+        }};
+    }
+
+    let arrays: Vec<ArrayRef> = vec![
+        build_prim!(id, Int32Builder),
+        build_string!(name),
+        build_prim!(value, UInt64Builder),
+        build_string!(category),
+        build_string!(tag),
+        build_string!(meta_created),
+        build_string!(meta_updated),
+
+        build_string!(reading_timestamp),
+        build_string!(reading_sensor),
+        build_prim!(reading_value, Float64Builder),
+
+        build_string!(measurement_type),
+        build_string!(measurement_data),
+        build_prim!(method_max, UInt64Builder),
+        build_prim!(method_min, UInt64Builder),
+        build_prim!(method_hash, Float64Builder),
+
+        build_prim!(lat, Float64Builder),
+        build_prim!(lon, Float64Builder),
+        build_string!(h3_cell),
+        build_string!(country_code),
+        build_string!(region_hash),
+        build_string!(region_id),
+
+        build_prim!(stat_mean, UInt64Builder),
+        build_prim!(stat_mode, UInt64Builder),
+        build_prim!(stat_range, UInt64Builder),
+
+        build_prim!(physics_velocity, Float64Builder),
+        build_prim!(physics_acceleration, Float64Builder),
+        build_prim!(physics_mass, Float64Builder),
+
+        build_string!(history_previous),
+        build_string!(history_trend),
+
+        build_prim!(business_revenue, Float64Builder),
+        build_string!(business_outlook),
+    ];
+
+    RecordBatch::try_new(schema, arrays).unwrap()
+}
+fn write_parquet(batch: &RecordBatch, path: &str) {
+    let file = File::create(path).unwrap();
+
+    let props = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .build();
+
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+    writer.write(batch).unwrap();
+    writer.close().unwrap();
+}
+
 type PartitionKey = (Option<i32>, Option<String>, Option<String>, Option<u64>);
 
 
 fn main() {
-    let num_records = 100_000;
+    let num_records = 5_000;
     let threads = 8;
-    let flush_threshold = 100_000;
-
+    let flush_threshold = 250_000;
     let start = Instant::now();
 
     // Shared concurrent hashmap (Arc so all threads can access)
@@ -573,12 +698,13 @@ fn main() {
         .build()
         .unwrap();
 
+    
 
     // 🧩 Producer: parse + flatten in parallel
     pool.install(|| {
         (0..num_records).into_par_iter().for_each(|_| {
             let mut rng = rand::rng();
-            let val: u64 = rng.random_range(1..=100); // random partition value
+            let val: u64 = rng.random_range(1..=1);
 
             let record = Record {
                 id: Some(vec![42]),
@@ -689,22 +815,21 @@ fn main() {
                 // If this partition is "big enough", flush it
                 if entry.len() >= flush_threshold {
                     // Take ownership of rows by swapping with empty vec
+                    let mut rng_2 = rand::rng();
+                    let rand_ending: u64 = rng_2.random_range(1000..=9999);
+                    
                     let flushed = std::mem::take(&mut *entry);
                     drop(entry); // release DashMap lock
-
-                    //println!(
-                    //    "💾 [Thread {:?}] Flushing {:?} ({} rows)",
-                    //    std::thread::current().id(),
-                    //    key,
-                    //    flushed.len()
-                    //);
-
-                    // TODO: convert flushed Vec<FlatRecord> -> Arrow + write Parquet
+                    
+                    let batch = to_arrow(&flushed);
+                    let filename = format!("{}_{}_{}_{}_{}.parquet", key.0.unwrap(), key.1.unwrap(), key.2.unwrap(), key.3.unwrap(), rand_ending);
+                    write_parquet(&batch, &filename);
                 }
             }
         });
     });
-
+    
+    
     // Final flush of remaining data
     for mut entry in partitions.iter_mut() {
         if !entry.is_empty() {
@@ -715,7 +840,11 @@ fn main() {
             //    key,
             //    flushed.len()
             //);
-            // TODO: write these to parquet as well
+            let mut rng_2 = rand::rng();
+            let rand_ending: u64 = rng_2.random_range(1000..=9999);
+            let batch = to_arrow(&flushed);
+            let filename = format!("{}_{}_{}_{}_{}.parquet", key.0.unwrap(), key.1.unwrap(), key.2.unwrap(), key.3.unwrap(), rand_ending);
+            write_parquet(&batch, &filename);
         }
     }
 
