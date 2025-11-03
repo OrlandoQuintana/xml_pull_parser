@@ -680,13 +680,13 @@ fn write_parquet(batch: &RecordBatch, path: &str) {
     writer.close().unwrap();
 }
 
-type PartitionKey = (Option<i32>, Option<String>, Option<String>, Option<u64>);
+type PartitionKey = (Option<i32>, Option<String>, Option<String>);
 
 
 fn main() {
-    let num_records = 5_000;
+    let num_records = 50_000;
     let threads = 8;
-    let flush_threshold = 250_000;
+    let flush_threshold = 2_000_000;
     let start = Instant::now();
 
     // Shared concurrent hashmap (Arc so all threads can access)
@@ -703,13 +703,11 @@ fn main() {
     // 🧩 Producer: parse + flatten in parallel
     pool.install(|| {
         (0..num_records).into_par_iter().for_each(|_| {
-            let mut rng = rand::rng();
-            let val: u64 = rng.random_range(1..=1);
 
             let record = Record {
                 id: Some(vec![42]),
                 name: Some(vec!["SensorClusterA".to_string()]),
-                value: Some(vec![val]),
+                value: Some(vec![1]),
                 category: Some(vec!["Temperature".to_string()]),
                 tags: Some(vec!["tag1".into(), "tag2".into(), "tag3".into()]),
                 meta_created: Some(vec!["2025-11-01T00:00Z".into()]),
@@ -804,8 +802,7 @@ fn main() {
                 let key = (
                     row.id,
                     row.name.clone(),
-                    row.category.clone(),
-                    row.value,
+                    row.category.clone()
                 );
 
                 // Get mutable reference to Vec<FlatRecord> in map
@@ -822,7 +819,7 @@ fn main() {
                     drop(entry); // release DashMap lock
                     
                     let batch = to_arrow(&flushed);
-                    let filename = format!("{}_{}_{}_{}_{}.parquet", key.0.unwrap(), key.1.unwrap(), key.2.unwrap(), key.3.unwrap(), rand_ending);
+                    let filename = format!("{}_{}_{}_{}.parquet", key.0.unwrap(), key.1.unwrap(), key.2.unwrap(), rand_ending);
                     write_parquet(&batch, &filename);
                 }
             }
@@ -843,7 +840,7 @@ fn main() {
             let mut rng_2 = rand::rng();
             let rand_ending: u64 = rng_2.random_range(1000..=9999);
             let batch = to_arrow(&flushed);
-            let filename = format!("{}_{}_{}_{}_{}.parquet", key.0.unwrap(), key.1.unwrap(), key.2.unwrap(), key.3.unwrap(), rand_ending);
+            let filename = format!("{}_{}_{}_{}.parquet", key.0.unwrap(), key.1.unwrap(), key.2.unwrap(), rand_ending);
             write_parquet(&batch, &filename);
         }
     }
