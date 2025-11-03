@@ -2,6 +2,15 @@ use std::fmt;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::time::Instant;
+use crossbeam::channel;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
+use rand::Rng;
+use ahash::AHashMap;
+use std::thread;
+use std::sync::Arc;
+use dashmap::DashMap;
 
 #[derive(Debug, Clone, Default)]
 struct Business {
@@ -371,7 +380,7 @@ impl Reading {
 struct Record {
     id: Option<Vec<i32>>,
     name: Option<Vec<String>>,
-    value: Option<Vec<f64>>,
+    value: Option<Vec<u64>>,
     category: Option<Vec<String>>,
     tags: Option<Vec<String>>,
     meta_created: Option<Vec<String>>,
@@ -485,7 +494,7 @@ impl Record {
 struct FlatRecord {
     id: Option<i32>,
     name: Option<String>,
-    value: Option<f64>,
+    value: Option<u64>,
     category: Option<String>,
     tag: Option<String>,
     meta_created: Option<String>,
@@ -545,133 +554,175 @@ impl fmt::Display for FlatRecord {
     }
 }
 
-fn main() {
-    let num_records = 100_000usize;
-    let batch_size = 2_000usize;
-    let threads = 8;
+type PartitionKey = (Option<i32>, Option<String>, Option<String>, Option<u64>);
 
+
+fn main() {
+    let num_records = 100_000;
+    let threads = 8;
+    let flush_threshold = 100_000;
+
+    let start = Instant::now();
+
+    // Shared concurrent hashmap (Arc so all threads can access)
+    let partitions: Arc<DashMap<PartitionKey, Vec<FlatRecord>>> = Arc::new(DashMap::new());
+
+    // Rayon pool
     let pool = ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .unwrap();
-    
-    
-    // Create fake nested data for testing.
 
-    let start = Instant::now();
 
+    // 🧩 Producer: parse + flatten in parallel
     pool.install(|| {
-        (0..num_records)
-            .into_par_iter()
-            .chunks(batch_size)
-            .for_each(|batch_indices| {
-                // Build and flatten only this batch in memory
-                let mut batch_out = Vec::new();
-                for _ in batch_indices {
-                    let record = Record {
-                        id: Some(vec![42]),
-                        name: Some(vec!["SensorClusterA".to_string()]),
-                        value: Some(vec![123.45]),
-                        category: Some(vec!["Temperature".to_string()]),
-                        tags: Some(vec!["tag1".into(), "tag2".into(), "tag3".into()]),
-                        meta_created: Some(vec!["2025-11-01T00:00Z".into()]),
-                        meta_updated: Some(vec!["2025-11-01T12:00Z".into()]),
+        (0..num_records).into_par_iter().for_each(|_| {
+            let mut rng = rand::rng();
+            let val: u64 = rng.random_range(1..=100); // random partition value
 
-                        readings: Some(
-                            (0..15)
-                                .map(|i| Reading {
-                                    timestamp: Some(format!("2025-11-01T00:{:02}:00Z", i)),
-                                    sensor: Some(format!("therm-{:02}", i)),
-                                    value: Some(20.0 + i as f64),
-                                })
-                                .collect(),
-                        ),
+            let record = Record {
+                id: Some(vec![42]),
+                name: Some(vec!["SensorClusterA".to_string()]),
+                value: Some(vec![val]),
+                category: Some(vec!["Temperature".to_string()]),
+                tags: Some(vec!["tag1".into(), "tag2".into(), "tag3".into()]),
+                meta_created: Some(vec!["2025-11-01T00:00Z".into()]),
+                meta_updated: Some(vec!["2025-11-01T12:00Z".into()]),
 
-                        measurements: Some(
-                            (0..15)
-                                .map(|i| Measurement {
-                                    r#type: Some(format!("MType{}", i)),
-                                    data: Some(format!("MData{}", i)),
-                                    method: Some(
-                                        (0..2)
-                                            .map(|j| Method {
-                                                max: Some(100 + j as u64),
-                                                min: Some(j as u64),
-                                                hash: Some(0.5 * j as f64),
-                                            })
-                                            .collect(),
-                                    ),
-                                })
-                                .collect(),
-                        ),
+                readings: Some(
+                    (0..15)
+                        .map(|i| Reading {
+                            timestamp: Some(format!("2025-11-01T00:{:02}:00Z", i)),
+                            sensor: Some(format!("therm-{:02}", i)),
+                            value: Some(20.0 + i as f64),
+                        })
+                        .collect(),
+                ),
 
-                        locations: Some(
-                            (0..15)
-                                .map(|i| Location {
-                                    lat: Some(40.0 + i as f64 * 0.1),
-                                    lon: Some(-105.0 - i as f64 * 0.1),
-                                    region: Some(vec![Region {
-                                        h3_cell: Some(format!("8f28308208{}", i)),
-                                        country_code: Some("US".into()),
-                                        region_ID: Some(vec![RegionID {
-                                            region_hash: Some(format!("hash{}", i)),
-                                            region_id: Some(format!("RID{}", i)),
-                                        }]),
-                                    }]),
-                                })
-                                .collect(),
-                        ),
+                measurements: Some(
+                    (0..15)
+                        .map(|i| Measurement {
+                            r#type: Some(format!("MType{}", i)),
+                            data: Some(format!("MData{}", i)),
+                            method: Some(
+                                (0..2)
+                                    .map(|j| Method {
+                                        max: Some(100 + j as u64),
+                                        min: Some(j as u64),
+                                        hash: Some(0.5 * j as f64),
+                                    })
+                                    .collect(),
+                            ),
+                        })
+                        .collect(),
+                ),
 
-                        statistics: Some(
-                            (0..15)
-                                .map(|i| Stat {
-                                    mean: Some(10 + i),
-                                    mode: Some(20 + i),
-                                    range: Some(5 + i),
-                                    physics: Some(
-                                        (0..3)
-                                            .map(|j| Physics {
-                                                velocity: Some(1.0 + j as f64),
-                                                acceleration: Some(0.1 * j as f64),
-                                                mass: Some(5.0 + j as f64),
-                                            })
-                                            .collect(),
-                                    ),
-                                    history: Some(
-                                        (0..2)
-                                            .map(|j| History {
-                                                previous: Some(format!("prev{}", j)),
-                                                trend: Some(format!("trend{}", j)),
-                                            })
-                                            .collect(),
-                                    ),
-                                    business: Some(
-                                        (0..2)
-                                            .map(|j| Business {
-                                                revenue: Some(1000.0 + j as f64 * 500.0),
-                                                outlook: Some(format!("outlook{}", j)),
-                                            })
-                                            .collect(),
-                                    ),
-                                })
-                                .collect(),
-                        ),
-                    };
+                locations: Some(
+                    (0..15)
+                        .map(|i| Location {
+                            lat: Some(40.0 + i as f64 * 0.1),
+                            lon: Some(-105.0 - i as f64 * 0.1),
+                            region: Some(vec![Region {
+                                h3_cell: Some(format!("8f28308208{}", i)),
+                                country_code: Some("US".into()),
+                                region_ID: Some(vec![RegionID {
+                                    region_hash: Some(format!("hash{}", i)),
+                                    region_id: Some(format!("RID{}", i)),
+                                }]),
+                            }]),
+                        })
+                        .collect(),
+                ),
 
-                    batch_out.extend(record.flatten());
+                statistics: Some(
+                    (0..15)
+                        .map(|i| Stat {
+                            mean: Some(10 + i),
+                            mode: Some(20 + i),
+                            range: Some(5 + i),
+                            physics: Some(
+                                (0..3)
+                                    .map(|j| Physics {
+                                        velocity: Some(1.0 + j as f64),
+                                        acceleration: Some(0.1 * j as f64),
+                                        mass: Some(5.0 + j as f64),
+                                    })
+                                    .collect(),
+                            ),
+                            history: Some(
+                                (0..2)
+                                    .map(|j| History {
+                                        previous: Some(format!("prev{}", j)),
+                                        trend: Some(format!("trend{}", j)),
+                                    })
+                                    .collect(),
+                            ),
+                            business: Some(
+                                (0..2)
+                                    .map(|j| Business {
+                                        revenue: Some(1000.0 + j as f64 * 500.0),
+                                        outlook: Some(format!("outlook{}", j)),
+                                    })
+                                    .collect(),
+                            ),
+                        })
+                        .collect(),
+                ),
+            };
+
+
+            let flat = record.flatten();
+
+            // Access shared DashMap
+            for row in flat {
+                let key = (
+                    row.id,
+                    row.name.clone(),
+                    row.category.clone(),
+                    row.value,
+                );
+
+                // Get mutable reference to Vec<FlatRecord> in map
+                let mut entry = partitions.entry(key.clone()).or_default();
+                entry.push(row);
+
+                // If this partition is "big enough", flush it
+                if entry.len() >= flush_threshold {
+                    // Take ownership of rows by swapping with empty vec
+                    let flushed = std::mem::take(&mut *entry);
+                    drop(entry); // release DashMap lock
+
+                    //println!(
+                    //    "💾 [Thread {:?}] Flushing {:?} ({} rows)",
+                    //    std::thread::current().id(),
+                    //    key,
+                    //    flushed.len()
+                    //);
+
+                    // TODO: convert flushed Vec<FlatRecord> -> Arrow + write Parquet
                 }
-
-                // pretend to do something with the result
-                std::hint::black_box(batch_out);
-            });
+            }
+        });
     });
 
-    let elapsed = start.elapsed();
-    let secs = elapsed.as_secs_f64();
-    let rate = num_records as f64 / secs;
+    // Final flush of remaining data
+    for mut entry in partitions.iter_mut() {
+        if !entry.is_empty() {
+            let key = entry.key().clone();
+            let flushed = std::mem::take(&mut *entry);
+            //println!(
+            //    "🧹 Final flush for {:?} ({} rows)",
+            //    key,
+            //    flushed.len()
+            //);
+            // TODO: write these to parquet as well
+        }
+    }
 
+    let elapsed = start.elapsed();
     println!(
-        "✅ Flattened {} records in {:.2}s ({:.1} recs/sec) using {} threads",
-        num_records, secs, rate, threads
+        "🏁 Completed in {:.2}s ({:.1} recs/sec)",
+        elapsed.as_secs_f64(),
+        num_records as f64 / elapsed.as_secs_f64()
     );
 }
