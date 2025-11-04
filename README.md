@@ -292,7 +292,9 @@ cargo run --release
 ```
 
 ```bash
-RUSTFLAGS="-C target-cpu=native -C embed-bitcode=no" cargo build --release
+cargo build --release
+
+./target/release/xml_pull_parser
 ```
 
 ---
