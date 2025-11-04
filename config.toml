@@ -1,0 +1,6 @@
+[profile.release]
+lto = "fat"                # Link-time optimization across all crates
+codegen-units = 1          # One codegen unit = maximal inlining
+opt-level = 3              # Full optimization
+strip = "symbols"          # Smaller binary (faster cold-load)
+panic = "abort"            # Slightly smaller, faster
