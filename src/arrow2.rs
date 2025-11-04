@@ -133,6 +133,7 @@ fn to_arrow2(rows: &[FlatRecord]) -> RecordBatch {
     // Macros to build columns (arrow2 uses MutableArrays)
     // ─────────────────────────────────────────────────────────────
 
+    // ---- UTF8 builder ----
     macro_rules! build_utf8 {
         ($name:ident) => {{
             let mut col = MutableUtf8Array::<i32>::with_capacity(rows.len());
@@ -142,10 +143,11 @@ fn to_arrow2(rows: &[FlatRecord]) -> RecordBatch {
                     None => col.push_null(),
                 }
             }
-            Arc::new(col.into_boxed()) as Arc<dyn Array>
+            col.into_arc() as Arc<dyn Array>
         }};
     }
-
+    
+    // ---- Numeric primitive builder ----
     macro_rules! build_prim {
         ($name:ident, $ty:ty) => {{
             let mut col = MutablePrimitiveArray::<$ty>::with_capacity(rows.len());
@@ -155,7 +157,21 @@ fn to_arrow2(rows: &[FlatRecord]) -> RecordBatch {
                     None => col.push_null(),
                 }
             }
-            Arc::new(col.into_boxed()) as Arc<dyn Array>
+            col.into_arc() as Arc<dyn Array>
+        }};
+    }
+    
+    // ---- Boolean builder ----
+    macro_rules! build_bool {
+        ($name:ident) => {{
+            let mut col = MutableBooleanArray::with_capacity(rows.len());
+            for r in rows {
+                match r.$name {
+                    Some(v) => col.push(Some(v)),
+                    None => col.push_null(),
+                }
+            }
+            col.into_arc() as Arc<dyn Array>
         }};
     }
 
