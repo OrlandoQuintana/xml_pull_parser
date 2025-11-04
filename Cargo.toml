@@ -10,3 +10,5 @@ rayon ="1.11.0"
 crossbeam = "0.8.4"
 ahash = "0.8"
 dashmap = "6.1.0"
+arrow2 = { version = "0.18", features = ["io_parquet", "io_parquet_write"] }
+parquet2 = "0.18"
