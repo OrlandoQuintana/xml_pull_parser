@@ -1,21 +1,70 @@
+use std::fs::{self, File};
+use std::path::Path;
+use std::sync::Arc;
+
 use arrow2::array::*;
 use arrow2::datatypes::*;
 use arrow2::record_batch::RecordBatch;
-use std::fs::File;
-use std::sync::Arc;
-use parquet2::write::*;
-use parquet2::schema::types::*;
-use parquet2::compression::CompressionOptions;
 use arrow2::io::parquet::write as arrow_parquet;
 
-const WRITE_OPTIONS: WriteOptions = WriteOptions {
+use parquet2::compression::CompressionOptions;
+use parquet2::write::{FileWriter, Version, WriteOptions};
+
+static WRITE_OPTIONS: WriteOptions = WriteOptions {
     write_statistics: true,
     compression: CompressionOptions::Snappy,
     version: Version::V2,
     data_pagesize_limit: None,
 };
 
-fn write_parquet2(batch: &arrow2::record_batch::RecordBatch, path: &str) {
+pub fn write_parquet2(
+    batch: &RecordBatch,
+    key: &(Option<i32>, Option<String>, Option<String>, Option<u64>),
+    base_dir: &str,
+) -> std::io::Result<String> {
+    // Build safe, Delta-style directory path
+    let id_str = key.0.map(|v| v.to_string()).unwrap_or_else(|| "unknown".into());
+    let name_str = key.1.as_deref().unwrap_or("unknown");
+    let category_str = key.2.as_deref().unwrap_or("unknown");
+    let value_str = key.3.map(|v| v.to_string()).unwrap_or_else(|| "unknown".into());
+
+    // Example: data/id=42/name=SensorClusterA/category=Temperature/
+    let dir_path = Path::new(base_dir)
+        .join(format!("id={}", id_str))
+        .join(format!("name={}", name_str))
+        .join(format!("category={}", category_str));
+
+    // Ensure directories exist
+    fs::create_dir_all(&dir_path)?;
+
+    // Construct full parquet filename inside this directory
+    let filename = format!("value={}.parquet", value_str);
+    let full_path = dir_path.join(&filename);
+
+    // Create output file
+    let file = File::create(&full_path)
+        .unwrap_or_else(|e| panic!("Failed to create Parquet file '{}': {}", full_path.display(), e));
+
+    // Convert Arrow schema → Parquet schema
+    let arrow_schema = batch.schema();
+    let parquet_schema = arrow_parquet::to_parquet_schema(arrow_schema.as_ref());
+
+    // Convert Arrow batch → Parquet row group
+    let row_group = arrow_parquet::to_row_group(batch, WRITE_OPTIONS)
+        .expect("Failed to convert RecordBatch to RowGroup");
+
+    // Initialize Parquet writer and write
+    let mut writer = FileWriter::try_new(file, parquet_schema, WRITE_OPTIONS)
+        .expect("Failed to create parquet2 FileWriter");
+
+    writer.write(row_group).expect("Write failed");
+    writer.end(None).expect("Failed to finalize parquet file");
+
+    println!("💾 Wrote Parquet file to {}", full_path.display());
+    Ok(full_path.to_string_lossy().into_owned())
+}
+
+fn write_parquet(batch: &arrow2::record_batch::RecordBatch, path: &str) {
     let file = File::create(path).expect("Failed to create parquet file");
 
     let arrow_schema = batch.schema();
