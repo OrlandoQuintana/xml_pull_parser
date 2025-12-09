@@ -201,6 +201,9 @@ for target_cell in cells:
             for mt in measurement_types
         ])
 
+    # Remove original measurement-weight columns
+    rolling = rolling.drop_columns(measurement_types)
+    
     ###############################################################
     # STEP 13: Save feature table for this cell
     ###############################################################
