@@ -7,7 +7,11 @@ import polars as pl
 PARQUET_PATH = "s3://bucket/path/**/*.parquet"
 
 # Define rolling window sizes
-WINDOWS = ["1h", "6h", "12h", "24h"]
+WINDOWS = {
+    "1h": 1,
+    "6h": 6,
+    "12h": 12,
+    "24h": 24,
 
 # Output folder
 OUTPUT_PATH = "s3://bucket/features/"
@@ -179,20 +183,22 @@ for target_cell in cells:
     ###############################################################
     rolling = pivoted
 
-    for win in WINDOWS:
-        # Sum window
+    for label, span in WINDOWS.items():
+        # Sum over window
         rolling = rolling.with_columns([
-            pl.col(measurement_types)
-              .rolling_sum(win)
-              .suffix(f"__sum_{win}")
+            pl.col(mt)
+              .rolling_sum(span)
+              .alias(f"{mt}__sum_{label}")
+            for mt in measurement_types
         ])
-
-        # Count (presence window)
+    
+        # Count of presence over window (nonzero)
         rolling = rolling.with_columns([
-            (pl.col(measurement_types) > 0)
-               .cast(pl.Int32)
-               .rolling_sum(win)
-               .suffix(f"__count_{win}")
+            (pl.col(mt) > 0)
+              .cast(pl.Int32)
+              .rolling_sum(span)
+              .alias(f"{mt}__count_{label}")
+            for mt in measurement_types
         ])
 
     ###############################################################
