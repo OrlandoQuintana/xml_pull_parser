@@ -6,21 +6,37 @@ import polars as pl
 
 PARQUET_PATH = "s3://bucket/path/**/*.parquet"
 
-# Define your time windows
+# Define rolling window sizes
 WINDOWS = ["1h", "6h", "12h", "24h"]
 
-# Output folder for feature tables
+# Output folder
 OUTPUT_PATH = "s3://bucket/features/"
 
 
 ###############################################################
-# LAZY SCAN ENTIRE DATASET (DO NOT LOAD EVERYTHING)
+# GLOBAL LAZY SCAN
 ###############################################################
 lf = pl.scan_parquet(PARQUET_PATH)
 
 
 ###############################################################
-# STEP 0: GET ALL UNIQUE H3 CELLS (res3)
+# STEP 0: BUILD GLOBAL MEASUREMENT VOCABULARY
+###############################################################
+print("Extracting global measurement vocabulary…")
+
+global_vocab = (
+    lf.filter(pl.col("measurement_type").is_not_null())
+      .select("measurement_type")
+      .unique()
+      .collect()
+)
+
+measurement_types = global_vocab["measurement_type"].to_list()
+print(f"Found {len(measurement_types)} measurement types.")
+
+
+###############################################################
+# STEP 1: GET ALL UNIQUE H3 CELLS (res3)
 ###############################################################
 print("Extracting all unique H3 cells…")
 
@@ -35,7 +51,6 @@ cells = unique_cells_df["h3_res3"].to_list()
 print(f"Found {len(cells)} unique cells.")
 
 
-
 ###############################################################
 # PROCESS EACH CELL
 ###############################################################
@@ -47,7 +62,7 @@ for target_cell in cells:
     print("==============================\n")
 
     ###############################################################
-    # STEP 1: Find all obs_ids that contribute ANY weight to this cell
+    # STEP 2: Find all obs_ids that have ANY weight in this cell
     ###############################################################
     obs_ids_lf = (
         lf.filter(pl.col("h3_res3") == target_cell)
@@ -56,7 +71,7 @@ for target_cell in cells:
     )
 
     ###############################################################
-    # STEP 2: Load ALL rows (locations + measurements) for these obs_ids
+    # STEP 3: Load all rows for these obs_ids
     ###############################################################
     df = (
         lf.filter(pl.col("obs_id").is_in(obs_ids_lf))
@@ -70,7 +85,7 @@ for target_cell in cells:
 
 
     ###############################################################
-    # STEP 3: Build loc_df = candidate locations grouped by h3 cell
+    # STEP 4: Build loc_df (candidate locations)
     ###############################################################
     loc_df = (
         df.filter(pl.col("location_weight").is_not_null())
@@ -83,8 +98,9 @@ for target_cell in cells:
           ])
     )
 
+
     ###############################################################
-    # STEP 4: Build meas_df = measurement candidates grouped by obs_id
+    # STEP 5: Build meas_df (candidate measurement types)
     ###############################################################
     meas_df = (
         df.filter(pl.col("measurement_weight").is_not_null())
@@ -99,7 +115,7 @@ for target_cell in cells:
 
 
     ###############################################################
-    # STEP 5: Expand location ambiguity (explode)
+    # STEP 6: Explode location ambiguity
     ###############################################################
     loc_expanded = (
         loc_df
@@ -112,19 +128,19 @@ for target_cell in cells:
 
 
     ###############################################################
-    # STEP 6: Join location + measurement ambiguity
+    # STEP 7: Join with measurement ambiguity
     ###############################################################
     joined = loc_expanded.join(meas_df, on="obs_id", how="left")
 
 
     ###############################################################
-    # STEP 7: Explode measurement lists (→ atomic rows)
+    # STEP 8: Explode measurement lists → atomic rows
     ###############################################################
     joined_expanded = joined.explode(["measurement_types", "measurement_weights"])
 
 
     ###############################################################
-    # STEP 8: Compute PMHT-style weighted signal contribution
+    # STEP 9: Compute PMHT-style weighted contribution
     ###############################################################
     final = joined_expanded.with_columns([
         (pl.col("location_weight") * pl.col("measurement_weights"))
@@ -133,7 +149,7 @@ for target_cell in cells:
 
 
     ###############################################################
-    # STEP 9: Pivot into wide format (one column per measurement type)
+    # STEP 10: Pivot to wide format
     ###############################################################
     pivoted = final.pivot(
         index="timestamp",
@@ -144,19 +160,37 @@ for target_cell in cells:
 
 
     ###############################################################
-    # STEP 10: Rolling-window feature creation
+    # STEP 11: Ensure full measurement vocabulary exists
+    ###############################################################
+    for mt in measurement_types:
+        if mt not in pivoted.columns:
+            pivoted = pivoted.with_columns(pl.lit(0.0).alias(mt))
+
+
+    ###############################################################
+    # STEP 12: Rolling-window feature generation
     ###############################################################
     rolling = pivoted
 
     for win in WINDOWS:
+        # Sum
         rolling = rolling.with_columns([
-            pl.all().exclude("timestamp")
-                  .rolling_sum(win)
-                  .suffix(f"__sum_{win}")
+            pl.col(measurement_types)
+              .rolling_sum(win)
+              .suffix(f"__sum_{win}")
         ])
 
+        # Count (nonzero signal presence)
+        rolling = rolling.with_columns([
+            (pl.col(measurement_types) > 0)
+               .cast(pl.Int32)
+               .rolling_sum(win)
+               .suffix(f"__count_{win}")
+        ])
+
+
     ###############################################################
-    # STEP 11: Save as Parquet / Delta partitioned by H3 cell
+    # STEP 13: Save feature table for this cell
     ###############################################################
     output_file = f"{OUTPUT_PATH}/h3={target_cell}/features.parquet"
     rolling.write_parquet(output_file)
