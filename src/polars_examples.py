@@ -75,12 +75,13 @@ for target_cell in cells:
         lf.filter(pl.col("obs_id").is_in(obs_ids_lf))
           .collect()
     )
-
-    # Convert ISO timestamp string → Polars Datetime
+    
     df = df.with_columns([
-        pl.col("timestamp").str.strptime(pl.Datetime, strict=False).alias("timestamp")
+        pl.col("timestamp")
+          .str.to_datetime()
+          .dt.replace_time_zone("UTC")
     ])
-
+    
     df = df.sort("timestamp")
 
     if df.is_empty():
