@@ -12,12 +12,10 @@ WINDOWS = ["1h", "6h", "12h", "24h"]
 # Output folder
 OUTPUT_PATH = "s3://bucket/features/"
 
-
 ###############################################################
 # GLOBAL LAZY SCAN
 ###############################################################
 lf = pl.scan_parquet(PARQUET_PATH)
-
 
 ###############################################################
 # STEP 0: BUILD GLOBAL MEASUREMENT VOCABULARY
@@ -76,8 +74,14 @@ for target_cell in cells:
     df = (
         lf.filter(pl.col("obs_id").is_in(obs_ids_lf))
           .collect()
-          .sort("timestamp")
     )
+
+    # Convert ISO timestamp string → Polars Datetime
+    df = df.with_columns([
+        pl.col("timestamp").str.strptime(pl.Datetime, strict=False).alias("timestamp")
+    ])
+
+    df = df.sort("timestamp")
 
     if df.is_empty():
         print(f"Cell {target_cell} has no data — skipping.")
@@ -98,7 +102,6 @@ for target_cell in cells:
           ])
     )
 
-
     ###############################################################
     # STEP 5: Build meas_df (candidate measurement types)
     ###############################################################
@@ -113,7 +116,6 @@ for target_cell in cells:
           ])
     )
 
-
     ###############################################################
     # STEP 6: Explode location ambiguity
     ###############################################################
@@ -126,18 +128,15 @@ for target_cell in cells:
           })
     )
 
-
     ###############################################################
     # STEP 7: Join with measurement ambiguity
     ###############################################################
     joined = loc_expanded.join(meas_df, on="obs_id", how="left")
 
-
     ###############################################################
     # STEP 8: Explode measurement lists → atomic rows
     ###############################################################
     joined_expanded = joined.explode(["measurement_types", "measurement_weights"])
-
 
     ###############################################################
     # STEP 9: Compute PMHT-style weighted contribution
@@ -147,9 +146,8 @@ for target_cell in cells:
             .alias("signal_weight")
     ])
 
-
     ###############################################################
-    # STEP 10: Pivot to wide format
+    # STEP 10: Pivot into wide format
     ###############################################################
     pivoted = final.pivot(
         index="timestamp",
@@ -158,6 +156,15 @@ for target_cell in cells:
         aggregate_function="sum"
     ).sort("timestamp")
 
+    ###############################################################
+    # STEP 10B: Resample timestamps to exact 1-hour grid
+    ###############################################################
+    pivoted = (
+        pivoted
+            .set_sorted("timestamp")
+            .upsample(time_column="timestamp", every="1h")
+            .fill_null(0.0)
+    )
 
     ###############################################################
     # STEP 11: Ensure full measurement vocabulary exists
@@ -166,28 +173,26 @@ for target_cell in cells:
         if mt not in pivoted.columns:
             pivoted = pivoted.with_columns(pl.lit(0.0).alias(mt))
 
-
     ###############################################################
     # STEP 12: Rolling-window feature generation
     ###############################################################
     rolling = pivoted
 
     for win in WINDOWS:
-        # Sum
+        # Sum window
         rolling = rolling.with_columns([
             pl.col(measurement_types)
               .rolling_sum(win)
               .suffix(f"__sum_{win}")
         ])
 
-        # Count (nonzero signal presence)
+        # Count (presence window)
         rolling = rolling.with_columns([
             (pl.col(measurement_types) > 0)
                .cast(pl.Int32)
                .rolling_sum(win)
                .suffix(f"__count_{win}")
         ])
-
 
     ###############################################################
     # STEP 13: Save feature table for this cell
