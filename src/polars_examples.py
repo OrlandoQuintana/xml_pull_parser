@@ -12,6 +12,7 @@ WINDOWS = {
     "6h": 6,
     "12h": 12,
     "24h": 24,
+}
 
 # Output folder
 OUTPUT_PATH = "s3://bucket/features/"
@@ -63,35 +64,35 @@ for target_cell in cells:
     print(f"Processing cell: {target_cell}")
     print("==============================\n")
 
-    ###############################################################
-    # STEP 2: Find all obs_ids that have ANY weight in this cell
-    ###############################################################
-    obs_ids_lf = (
+    # STEP 2: materialize obs_ids as a Series
+    obs_ids = (
         lf.filter(pl.col("h3_res3") == target_cell)
           .select("obs_id")
           .unique()
-    )
-
-    ###############################################################
-    # STEP 3: Load all rows for these obs_ids
-    ###############################################################
-    df = (
-        lf.filter(pl.col("obs_id").is_in(obs_ids_lf))
           .collect()
+          .get_column("obs_id")
     )
-    
-    df = df.with_columns([
-        pl.col("timestamp")
-          .str.to_datetime()
-          .dt.replace_time_zone("UTC")
-    ])
-    
-    df = df.sort("timestamp")
 
-    if df.is_empty():
-        print(f"Cell {target_cell} has no data — skipping.")
+    if obs_ids.len() == 0:
+        print(f"Cell {target_cell} has no obs_ids — skipping.")
         continue
 
+    # STEP 3: load all rows for these obs_ids
+    df = (
+        lf.filter(pl.col("obs_id").is_in(obs_ids))
+          .collect()
+    )
+
+    # robust timestamp conversion
+    df = df.with_columns(
+        pl.col("timestamp")
+          .cast(pl.Utf8)
+          .str.to_datetime(strict=False)    # naive UTC
+    ).sort("timestamp")
+
+    if df.is_empty():
+        print(f"Cell {target_cell} has no data — skipping after ts parse.")
+        continue
 
     ###############################################################
     # STEP 4: Build loc_df (candidate locations)
