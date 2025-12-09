@@ -2,6 +2,7 @@
 loc_df = (
     df.filter(pl.col("location_weight").is_not_null())
       .select(["h3_res3", "obs_id", "location_weight"])
+      .unique()
       .group_by("h3_res3")
       .agg([
           pl.col("obs_id").list().alias("obs_ids"),
@@ -13,6 +14,7 @@ loc_df = (
 meas_df = (
     df.filter(pl.col("measurement_weight").is_not_null())
       .select(["obs_id", "measurement_type", "measurement_weight"])
+      .unique()
       .group_by("obs_id")
       .agg([
           pl.col("measurement_type").list().alias("measurement_types"),
