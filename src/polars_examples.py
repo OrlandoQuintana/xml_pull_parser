@@ -346,3 +346,301 @@ for cell_id, df_cell in features_df.groupby("h3_res3"):
     
     
     
+    
+    
+    
+    
+    
+    
+    
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import polars as pl
+from datetime import timedelta
+
+###############################################################
+# CONFIGURATION
+###############################################################
+
+PARQUET_PATH = "s3://bucket/path/**/*.parquet"
+
+# Rolling windows in HOURS (row count = hours since we use an hourly grid)
+WINDOWS = {
+    "1h": 1,
+    "6h": 6,
+    "12h": 12,
+    "24h": 24,
+}
+
+# Output locations
+OUTPUT_PATH_GLOBAL = "s3://bucket/features/global_features.parquet"
+OUTPUT_PATH_PER_CELL = "s3://bucket/features/cells"  # we'll do h3=<cell>/features.parquet
+
+# Adjust these if your flattened schema uses different names:
+LOCATION_LAT_COL = "location_lat"
+LOCATION_LON_COL = "location_lon"
+
+
+###############################################################
+# GLOBAL LAZY SCAN
+###############################################################
+lf = pl.scan_parquet(PARQUET_PATH)
+
+###############################################################
+# STEP 0: GLOBAL MEASUREMENT VOCABULARY
+###############################################################
+print("Extracting global measurement vocabulary…")
+
+global_vocab = (
+    lf.filter(pl.col("measurement_type").is_not_null())
+      .select("measurement_type")
+      .unique()
+      .collect()
+)
+
+measurement_types = global_vocab["measurement_type"].to_list()
+print(f"Found {len(measurement_types)} measurement types.")
+
+
+###############################################################
+# STEP 1: GLOBAL TIMESTAMP RANGE  (for global 1h grid)
+###############################################################
+print("Computing global timestamp bounds…")
+
+ts_bounds = (
+    lf.select(
+        pl.col("timestamp")
+          .cast(pl.Utf8)
+          .str.to_datetime(strict=False)
+          .alias("timestamp")
+    )
+    .select([
+        pl.col("timestamp").min().alias("min_ts"),
+        pl.col("timestamp").max().alias("max_ts"),
+    ])
+    .collect()
+)
+
+min_ts = ts_bounds["min_ts"][0]
+max_ts = ts_bounds["max_ts"][0]
+
+# Floor min_ts to the hour, ceil max_ts to the next hour
+min_ts = min_ts.replace(minute=0, second=0, microsecond=0)
+if max_ts.minute != 0 or max_ts.second != 0 or max_ts.microsecond != 0:
+    max_ts = (max_ts + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+
+print(f"Global time range: {min_ts} → {max_ts}")
+
+# Global hourly grid DataFrame (will be reused for every cell)
+global_hours = pl.DataFrame({
+    "timestamp": pl.datetime_range(
+        start=min_ts,
+        end=max_ts,
+        interval="1h",
+        closed="left",
+    )
+})
+
+
+###############################################################
+# STEP 2: BUILD GLOBAL PMHT-STYLE ATOMIC TABLE
+#   obs_id × location × meas_type → signal_weight per hour
+###############################################################
+
+# Location side:
+# One row per (obs_id, h3_res3, location_weight, lat, lon, timestamp_str).
+# We include lat/lon so that .unique() removes repeated rows caused by deeper
+# nested lists but *keeps* distinct candidate locations with different lat/lon.
+lf_loc = (
+    lf.filter(pl.col("location_weight").is_not_null())
+      .select([
+          "obs_id",
+          "h3_res3",
+          "location_weight",
+          LOCATION_LAT_COL,
+          LOCATION_LON_COL,
+          pl.col("timestamp").cast(pl.Utf8).alias("timestamp_str"),
+      ])
+      .unique()
+)
+
+# Measurement side:
+# One row per (obs_id, measurement_type, measurement_weight).
+# We also .unique() here in case the flattened schema can repeat these.
+lf_meas = (
+    lf.filter(pl.col("measurement_weight").is_not_null())
+      .select([
+          "obs_id",
+          "measurement_type",
+          "measurement_weight",
+      ])
+      .unique()
+)
+
+print("Building global atomic PMHT table…")
+
+lf_atomic = (
+    lf_loc.join(lf_meas, on="obs_id", how="inner")
+          .with_columns([
+              # Parse + truncate timestamps to hour buckets
+              pl.col("timestamp_str")
+                .str.to_datetime(strict=False)
+                .dt.truncate("1h")
+                .alias("timestamp"),
+
+              # PMHT-style signal weight:
+              #   signal_weight = location_weight * measurement_weight
+              (pl.col("location_weight") * pl.col("measurement_weight"))
+                  .alias("signal_weight"),
+          ])
+          # We no longer need lat/lon or the raw weight columns here for features;
+          # they have already been used to construct signal_weight.
+          .select([
+              "h3_res3",
+              "timestamp",
+              "measurement_type",
+              "signal_weight",
+          ])
+          .unique()  # extra safety: drop any exact duplicate atomic rows
+)
+
+# Materialize atomic table once
+atomic_df = lf_atomic.collect()
+print(f"Atomic PMHT table: {atomic_df.height} rows, {atomic_df.width} columns")
+
+
+###############################################################
+# STEP 3: DEFINE PER-CELL FEATURE BUILDER
+###############################################################
+
+def build_features_for_cell(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    df: all atomic rows for a single h3_res3 cell
+        columns: [h3_res3, timestamp, measurement_type, signal_weight]
+    returns: hourly-grid rolling feature table for this cell
+
+    Steps:
+      1. pivot to wide per timestamp (one col per measurement_type)
+      2. align to global hourly grid
+      3. ensure all global measurement_types exist as columns
+      4. compute rolling windows (sum + count) over the hourly grid
+      5. drop raw per-type columns, keep rolling features + timestamp + h3_res3
+    """
+
+    cell_id = df["h3_res3"][0]
+
+    # --- Pivot to wide (per-cell, per-hour, per-measurement_type sum of signal_weight) ---
+    pivoted = (
+        df.pivot(
+            index="timestamp",
+            columns="measurement_type",
+            values="signal_weight",
+            aggregate_function="sum",
+        )
+        .sort("timestamp")
+    )
+
+    # --- Align to global hourly grid (same time axis for all cells) ---
+    # Left join global_hours to pivoted; hours with no signal become 0.
+    pivoted = (
+        global_hours.join(pivoted, on="timestamp", how="left")
+                    .fill_null(0.0)
+    )
+
+    # --- Ensure full measurement vocabulary exists in columns ---
+    for mt in measurement_types:
+        if mt not in pivoted.columns:
+            pivoted = pivoted.with_columns(pl.lit(0.0).alias(mt))
+
+    # --- Rolling-window features ---
+    # At this point:
+    #   pivoted: timestamp | mt_1 | mt_2 | ... | mt_K
+    # where mt_i are all measurement_types, aligned on hourly grid.
+    rolling = pivoted.set_sorted("timestamp")
+
+    for label, span in WINDOWS.items():
+        # Sum of signal over window (span hours)
+        rolling = rolling.with_columns([
+            pl.col(mt)
+              .rolling_sum(span)
+              .alias(f"{mt}__sum_{label}")
+            for mt in measurement_types
+        ])
+
+        # Count of presence over window (nonzero)
+        rolling = rolling.with_columns([
+            (pl.col(mt) > 0)
+               .cast(pl.Int32)
+               .rolling_sum(span)
+               .alias(f"{mt}__count_{label}")
+            for mt in measurement_types
+        ])
+
+    # Drop the raw per-hour measurement-weight columns, keep timestamp for index
+    rolling = rolling.drop(measurement_types)
+
+    # Add h3_res3 column back as a constant for all rows in this cell
+    rolling = rolling.with_columns(pl.lit(cell_id).alias("h3_res3"))
+
+    # Optional: sort columns nicely (timestamp, h3_res3, then features)
+    cols = ["timestamp", "h3_res3"] + [
+        c for c in rolling.columns if c not in ("timestamp", "h3_res3")
+    ]
+    rolling = rolling.select(cols)
+
+    return rolling
+
+
+###############################################################
+# STEP 4: APPLY PER-CELL FEATURE BUILDER VIA group_by().map_groups()
+###############################################################
+print("Building per-cell feature tables inside Polars…")
+
+features_all_cells = (
+    atomic_df
+        .group_by("h3_res3", maintain_order=False)
+        .map_groups(build_features_for_cell)
+)
+
+print(f"Global features DF: {features_all_cells.height} rows, {features_all_cells.width} cols")
+
+
+###############################################################
+# STEP 5: WRITE ONE BIG GLOBAL TABLE
+###############################################################
+print(f"Writing global feature table → {OUTPUT_PATH_GLOBAL}")
+features_all_cells.write_parquet(OUTPUT_PATH_GLOBAL)
+
+
+###############################################################
+# STEP 6: WRITE ONE PARQUET PER CELL
+###############################################################
+print("Writing per-cell feature tables…")
+
+cell_groups = features_all_cells.partition_by("h3_res3", as_dict=True)
+
+for cell_id, df_cell in cell_groups.items():
+    out_path = f"{OUTPUT_PATH_PER_CELL}/h3={cell_id}/features.parquet"
+    df_cell.write_parquet(out_path)
+    # You can print or log intermittently if you want visibility:
+    # print(f"✔ Wrote {cell_id} → {out_path}")
+
+
+    
