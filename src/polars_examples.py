@@ -525,6 +525,11 @@ lf_atomic = (
           .unique()  # extra safety: drop any exact duplicate atomic rows
 )
 
+#lf_atomic.sink_parquet(
+    #output_path="atomic_pmht/",
+    #partition_by="h3_res3"
+#)
+
 # Materialize atomic table once
 atomic_df = lf_atomic.collect()
 print(f"Atomic PMHT table: {atomic_df.height} rows, {atomic_df.width} columns")
