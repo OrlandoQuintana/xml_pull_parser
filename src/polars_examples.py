@@ -212,3 +212,137 @@ for target_cell in cells:
     rolling.write_parquet(output_file)
 
     print(f"✔ Finished cell {target_cell} → {output_file}")
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+import polars as pl
+
+###############################################################
+# CONFIGURATION
+###############################################################
+
+PARQUET_PATH = "s3://bucket/path/**/*.parquet"
+WINDOWS = {"1h": 1, "6h": 6, "12h": 12, "24h": 24}
+OUTPUT_PATH = "s3://bucket/features/"
+
+
+###############################################################
+# GLOBAL LAZY SCAN
+###############################################################
+lf = pl.scan_parquet(PARQUET_PATH)
+
+###############################################################
+# STEP 0: GLOBAL MEASUREMENT VOCABULARY
+###############################################################
+global_vocab = (
+    lf.filter(pl.col("measurement_type").is_not_null())
+      .select("measurement_type")
+      .unique()
+      .collect()
+)
+measurement_types = global_vocab["measurement_type"].to_list()
+
+
+###############################################################
+# STEP 1: GLOBAL PMHT ATOMIC TABLE (NO CELL LOOP)
+###############################################################
+loc_lf = (
+    lf.filter(pl.col("location_weight").is_not_null())
+      .select(["obs_id", "timestamp", "h3_res3", "location_weight"])
+)
+
+meas_lf = (
+    lf.filter(pl.col("measurement_weight").is_not_null())
+      .select(["obs_id", "timestamp", "measurement_type", "measurement_weight"])
+)
+
+atomic_df = (
+    loc_lf.join(meas_lf, on=["obs_id", "timestamp"], how="inner")
+          .with_columns(
+              (pl.col("location_weight") * pl.col("measurement_weight"))
+                  .alias("signal_weight")
+          )
+          .with_columns(pl.col("timestamp").str.to_datetime())
+          .sort("timestamp")
+          .collect()
+)
+
+
+###############################################################
+# STEP 2: FEATURE BUILDER FOR ONE CELL
+###############################################################
+def build_features_for_cell(cell_df: pl.DataFrame) -> pl.DataFrame:
+
+    cell_id = cell_df["h3_res3"][0]
+
+    # Pivot wide
+    pivoted = (
+        cell_df.pivot(
+            index="timestamp",
+            columns="measurement_type",
+            values="signal_weight",
+            aggregate_function="sum"
+        )
+        .sort("timestamp")
+    )
+
+    # Hourly upsample WITHIN THIS CELL
+    pivoted = (
+        pivoted
+            .set_sorted("timestamp")
+            .upsample(time_column="timestamp", every="1h")
+            .fill_null(0.0)
+    )
+
+    # Add missing measurement types
+    for mt in measurement_types:
+        if mt not in pivoted.columns:
+            pivoted = pivoted.with_columns(pl.lit(0.0).alias(mt))
+
+    # Compute rolling windows
+    rolling = pivoted
+    for label, span in WINDOWS.items():
+        rolling = rolling.with_columns([
+            pl.col(mt).rolling_sum(span).alias(f"{mt}__sum_{label}")
+            for mt in measurement_types
+        ])
+        rolling = rolling.with_columns([
+            (pl.col(mt) > 0).cast(pl.Int32).rolling_sum(span).alias(f"{mt}__count_{label}")
+            for mt in measurement_types
+        ])
+
+    # Remove raw measurement columns
+    rolling = rolling.drop_columns(measurement_types)
+
+    # Add cell id
+    rolling = rolling.with_columns(pl.lit(cell_id).alias("h3_res3"))
+
+    return rolling
+
+
+###############################################################
+# STEP 3: APPLY FEATURE BUILDER FOR ALL CELLS IN PARALLEL
+###############################################################
+features_df = atomic_df.groupby("h3_res3").apply(build_features_for_cell)
+
+
+###############################################################
+# STEP 4: WRITE EACH CELL'S PARTITION
+###############################################################
+for cell_id, df_cell in features_df.groupby("h3_res3"):
+    out_path = f"{OUTPUT_PATH}/h3_res3={cell_id}.parquet"
+    df_cell.write_parquet(out_path)
+    print("Wrote", out_path)
+    
+    
+    
