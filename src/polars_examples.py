@@ -373,7 +373,7 @@ for cell_id, df_cell in features_df.groupby("h3_res3"):
 
 
 import polars as pl
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 ###############################################################
 # CONFIGURATION
@@ -449,11 +449,15 @@ if max_ts.minute != 0 or max_ts.second != 0 or max_ts.microsecond != 0:
 print(f"Global time range: {min_ts} → {max_ts}")
 
 # Global hourly grid DataFrame (will be reused for every cell)
+#min_ts = datetime(2024, 2, 2, 20, 0, 0)
+#max_ts = datetime(2025, 11, 26, 21, 0, 0)
+
 global_hours = pl.DataFrame({
-    "timestamp": pl.datetime_range(
+    "timestamp": pl.date_range(
         start=min_ts,
         end=max_ts,
         interval="1h",
+        eager=True,
         closed="left",
     )
 })
