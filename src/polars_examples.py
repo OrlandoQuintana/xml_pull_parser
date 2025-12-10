@@ -652,4 +652,18 @@ for cell_id, df_cell in cell_groups.items():
     # print(f"✔ Wrote {cell_id} → {out_path}")
 
 
+
+
+
+
+
+
+
+
+
+
+from concurrent.futures import ThreadPoolExecutor
+
+with ThreadPoolExecutor(max_workers=16) as pool:
+    pool.map(process_cell, all_cells)
     
