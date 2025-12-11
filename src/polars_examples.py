@@ -667,3 +667,32 @@ from concurrent.futures import ThreadPoolExecutor
 with ThreadPoolExecutor(max_workers=16) as pool:
     pool.map(process_cell, all_cells)
     
+    
+    
+    
+    
+    
+def build_labels_for_cell(events_df, global_hours, cell_id, windows):
+    # filter event rows for just this cell
+    ev = events_df.filter(pl.col("h3_res3") == cell_id)
+
+    # join onto hourly grid to create dense 0/1 series
+    labels = (
+        global_hours.join(ev.select(["timestamp", "label"]), on="timestamp", how="left")
+                    .with_columns(pl.col("label").fill_null(0))
+    )
+
+    # reverse for forward-looking windows
+    rev = labels.reverse()
+
+    for name, span in windows.items():
+        rev = rev.with_columns(
+            pl.col("label")
+                .rolling_max(span)
+                .alias(f"label_{name}")
+        )
+
+    # restore chronological order
+    labels = rev.reverse()
+
+    return labels
