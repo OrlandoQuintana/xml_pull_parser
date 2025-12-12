@@ -673,26 +673,75 @@ with ThreadPoolExecutor(max_workers=16) as pool:
     
     
 def build_labels_for_cell(events_df, global_hours, cell_id, windows):
-    # filter event rows for just this cell
+    """
+    events_df: dataframe of *all* events for the entire dataset,
+               with columns ["h3_res3", "timestamp", "label"]
+    global_hours: global hourly index
+    cell_id: the h3 cell we are labeling
+    windows: dict like {"1h": 1, "6h": 6, ...}
+    """
+
+    # 1) Filter just this cell's events
     ev = events_df.filter(pl.col("h3_res3") == cell_id)
 
-    # join onto hourly grid to create dense 0/1 series
+    # 2) Join onto the global hourly grid to create a dense 0/1 series
     labels = (
-        global_hours.join(ev.select(["timestamp", "label"]), on="timestamp", how="left")
-                    .with_columns(pl.col("label").fill_null(0))
+        global_hours.join(
+            ev.select(["timestamp", "label"]),
+            on="timestamp",
+            how="left"
+        )
+        .with_columns(pl.col("label").fill_null(0))   # fill missing hours with 0
     )
 
-    # reverse for forward-looking windows
+    # ================================================================
+    # 3) COARSE LABELS (regular forward-looking horizons)
+    # ================================================================
     rev = labels.reverse()
 
     for name, span in windows.items():
         rev = rev.with_columns(
             pl.col("label")
-                .rolling_max(span)
-                .alias(f"label_{name}")
+              .rolling_max(span)
+              .alias(f"label_{name}")   # e.g. label_6h
         )
 
-    # restore chronological order
-    labels = rev.reverse()
+    coarse_labels = rev.reverse()
 
-    return labels
+    # ================================================================
+    # 4) CONSERVATIVE LABELS (no leakage from event hour)
+    # ================================================================
+    # We need to "shift" the event indicator forward by 1 hour
+    # so that the hour containing the event is NOT marked as positive.
+    shifted = labels.with_columns(
+        pl.col("label").shift(-1).fill_null(0).alias("label_shifted")
+    )
+
+    rev_cons = shifted.reverse()
+
+    for name, span in windows.items():
+        rev_cons = rev_cons.with_columns(
+            pl.col("label_shifted")
+              .rolling_max(span)
+              .alias(f"label_{name}_cons")   # e.g. label_6h_cons
+        )
+
+    conservative_labels = rev_cons.reverse()
+
+    # ================================================================
+    # 5) Merge both sets into final label table
+    # ================================================================
+    final = labels.join(
+        coarse_labels.drop("label"),
+        on="timestamp",
+        how="inner"
+    ).join(
+        conservative_labels.drop(["label", "label_shifted"]),
+        on="timestamp",
+        how="inner"
+    )
+
+    # You now have:
+    # timestamp | label | label_1h | ... | label_24h | label_1h_cons | ... | label_24h_cons
+
+    return final
