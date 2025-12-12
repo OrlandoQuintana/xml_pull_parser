@@ -745,3 +745,119 @@ def build_labels_for_cell(events_df, global_hours, cell_id, windows):
     # timestamp | label | label_1h | ... | label_24h | label_1h_cons | ... | label_24h_cons
 
     return final
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    def build_hourly_event_series(events_df, global_hours, cell_id):
+    """
+    Returns:
+      timestamp | event
+    where event ∈ {0,1}
+    """
+
+    ev = (
+        events_df
+        .filter(pl.col("h3_res3") == cell_id)
+        .select(["timestamp", "label"])   # label is already 1
+    )
+
+    hourly = (
+        global_hours
+        .join(ev, on="timestamp", how="left")
+        .with_columns(
+            pl.col("label").fill_null(0).alias("event")
+        )
+        .select(["timestamp", "event"])
+    )
+
+    return hourly
+    
+    
+    
+def add_future_labels(hourly, windows):
+    """
+    Adds:
+      label_future_1h, label_future_6h, ...
+    """
+
+    rev = hourly.reverse()
+
+    for name, span in windows.items():
+        rev = rev.with_columns(
+            pl.col("event")
+              .rolling_max(span)
+              .shift(1)          # EXCLUDE current hour
+              .fill_null(0)
+              .alias(f"label_future_{name}")
+        )
+
+    return rev.reverse()
+    
+    
+    
+    
+    
+    
+def add_inclusive_labels(hourly, windows):
+    """
+    Adds:
+      label_inclusive_1h, label_inclusive_6h, ...
+    """
+
+    rev = hourly.reverse()
+
+    for name, span in windows.items():
+        rev = rev.with_columns(
+            pl.col("event")
+              .rolling_max(span)
+              .alias(f"label_inclusive_{name}")
+        )
+
+    return rev.reverse()
+    
+    
+def build_labels_for_cell(events_df, global_hours, cell_id, windows):
+    hourly = build_hourly_event_series(events_df, global_hours, cell_id)
+
+    hourly = add_future_labels(hourly, windows)
+    hourly = add_inclusive_labels(hourly, windows)
+
+    return hourly
+    
+    
+timestamp
+event
+label_future_1h
+label_future_6h
+label_future_12h
+label_future_24h
+label_inclusive_1h
+label_inclusive_6h
+label_inclusive_12h
+label_inclusive_24h
+    
+    
+    
+    
