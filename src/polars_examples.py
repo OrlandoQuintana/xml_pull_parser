@@ -859,5 +859,18 @@ label_inclusive_12h
 label_inclusive_24h
     
     
-    
+agg = (
+    df.group_by(["timestamp", "measurement_type"])
+      .agg([
+          pl.col("signal_weight").sum().alias("sum_w"),
+          pl.len().alias("cnt_w"),
+      ])
+)
+
+wide = agg.pivot(
+    index="timestamp",
+    columns="measurement_type",
+    values=["sum_w", "cnt_w"],
+    aggregate_function="sum",
+)
     
