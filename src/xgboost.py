@@ -78,10 +78,15 @@ class ParquetIter(xgb.core.DataIter):
                 continue
 
             df = select_training_columns(df)
-
+            
+            # ---- COLUMN ORDERING ----
+            feature_cols = sorted([c for c in df.columns if c != LABEL_COL])
+            df = df.select([LABEL_COL, *feature_cols])
+            # ---------------------------------
+            
             y = df[LABEL_COL].to_numpy("float32")
             X = df.drop(LABEL_COL).to_numpy("float32")
-
+            
             print(f"  ➜ Yield batch {cell}: {X.shape} rows x {X.shape[1]} cols")
             yield X, y
 
