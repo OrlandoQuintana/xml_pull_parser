@@ -1,6 +1,13 @@
 import datetime as dt
 import polars as pl
 import xgboost as xgb
+import os
+
+import os
+
+os.environ["FSSPEC_S3_CACHE_TYPE"] = "bytes"
+os.environ["FSSPEC_S3_CACHE_DIR"] = "/mnt/data/s3_cache"
+os.environ["FSSPEC_S3_CACHE_MAXSIZE"] = "15TB"  # or however large you want
 
 
 #############################################
