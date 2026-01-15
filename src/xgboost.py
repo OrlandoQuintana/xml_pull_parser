@@ -118,13 +118,18 @@ def build_datasets():
     dtrain = build_quantile_dmatrix(CELLS_TO_TRAIN, TRAIN_START, TRAIN_END)
 
     print("Building VAL dataset (QuantileDMatrix)")
-    dval = build_quantile_dmatrix(CELLS_TO_TRAIN, VAL_START, VAL_END)
+    dval = xgb.QuantileDMatrix(
+        ParquetIter(CELLS_TO_TRAIN, VAL_START, VAL_END),
+        ref=dtrain
+    )
 
     print("Building TEST dataset (QuantileDMatrix)")
-    dtest = build_quantile_dmatrix(CELLS_TO_TRAIN, TEST_START, TEST_END)
+    dtest = xgb.QuantileDMatrix(
+        ParquetIter(CELLS_TO_TRAIN, TEST_START, TEST_END),
+        ref=dtrain
+    )
 
     return dtrain, dval, dtest
-
 
 #############################################
 # TRAINING
