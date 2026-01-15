@@ -54,52 +54,53 @@ def select_training_columns(df):
 #############################################
 
 class ParquetIter(xgb.core.DataIter):
-    """
-    Streams X,y batches from parquets in S3.
-    """
-
     def __init__(self, cell_ids, start, end):
         super().__init__()
         self.cell_ids = cell_ids
         self.start = start
         self.end = end
-        self._reset_generator()
+        self._set_initial_state()
 
-    def _reset_generator(self):
+    def _set_initial_state(self):
         self._gen = self._make_generator()
+        self._at_beginning = True
+        self._seen_batch = False
+
+    def reset(self):
+        # Called by XGBoost before EVERY pass
+        self._set_initial_state()
 
     def _make_generator(self):
-        for cell in self.cell_ids:
-            df = load_parquet_from_s3(cell)
+        for cell_id in self.cell_ids:
+            df = load_parquet_from_s3(cell_id)
             df = time_slice(df, self.start, self.end)
 
             if df.is_empty():
-                print(f"  ⚠️ Cell {cell}: no rows in window")
                 continue
 
             df = select_training_columns(df)
-            
-            # ---- COLUMN ORDERING ----
+
+            # --- Sort features ---
             feature_cols = sorted([c for c in df.columns if c != LABEL_COL])
             df = df.select([LABEL_COL, *feature_cols])
-            # ---------------------------------
-            
+
             y = df[LABEL_COL].to_numpy("float32")
             X = df.drop(LABEL_COL).to_numpy("float32")
-            
-            print(f"  ➜ Yield batch {cell}: {X.shape} rows x {X.shape[1]} cols")
+
+            print(f"Yielding batch: {cell_id}: {X.shape}")
             yield X, y
 
     def next(self, input_data):
         try:
             X, y = next(self._gen)
+            self._seen_batch = True
             input_data(data=X, label=y)
-            return 0
+            return 0     # batch OK
         except StopIteration:
-            return 1
-
-    def reset(self):
-        self._reset_generator()
+            if not self._seen_batch:
+                # XGBoost will error unless we raise here
+                raise RuntimeError("Iterator yielded no batches!")
+            return 1     # signal end of this epoch
 
 
 def build_quantile_dmatrix(cell_ids, start, end):
