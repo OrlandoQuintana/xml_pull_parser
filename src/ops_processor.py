@@ -11,7 +11,8 @@ from typing import Iterable, Optional
 
 @dataclass
 class OpsParams:
-    # ---- Short-term (local) behavior windows ---
+    # ---- Short-term (local) behavior windows ----
+    # Interpreted as "hours" only when your data is hourly-contiguous.
     # These are computed within contiguous segments (resets on gaps).
     roll_mean_win: int = 24
     roll_std_win: int = 24
@@ -22,7 +23,7 @@ class OpsParams:
 
     # ---- Long-term (nominal) baseline ----
     # These DO NOT reset on gaps. They are computed over the full per-cell history.
-    # Note: These windows are in OBSERVATIONS (rows), not true hours.
+    # Note: These windows are in OBSERVATIONS (rows), not true hours, unless you densify.
     long_mean_win_obs: int = 24 * 30   # ~30 days if data is mostly hourly when present
     long_std_win_obs: int = 24 * 30
     long_ewma_alpha: float = 0.02      # slow-moving baseline mean
@@ -59,10 +60,8 @@ def load_pred_parquet(path: str, horizon: str) -> pl.DataFrame:
     if missing:
         raise ValueError(f"{path} missing columns: {missing}")
 
-    # If timestamp is a string in some runs, try to parse it.
-    # If it's already Datetime, this is a no-op.
+    # Parse timestamp if needed (no-op if already Datetime)
     if df.schema.get("timestamp") == pl.Utf8:
-        # If string timestamps include timezone, Polars will keep it as UTC if it can.
         df = df.with_columns(pl.col("timestamp").str.to_datetime(time_unit="ms"))
 
     df = df.rename({
@@ -311,6 +310,15 @@ def build_ops_outputs(
     metrics_top_fracs: Iterable[float] = (0.001, 0.01, 0.05),
     label_for_metrics: str = "label_1hr",  # usually you care about imminent (1hr) events operationally
 ) -> None:
+    """
+    Produces a single merged/enriched parquet that includes:
+      h3_cell, timestamp,
+      label_*, pred_* for all horizons,
+      long baseline features, short dynamics features,
+      ops_score
+
+    Also optionally writes per-hour metrics parquets.
+    """
     params = params or OpsParams()
 
     df1 = load_pred_parquet(pred_1hr_path, "1hr")
@@ -319,7 +327,7 @@ def build_ops_outputs(
 
     df = join_horizons(df1, df6, df12)
 
-    # Fill nulls defensively
+    # Fill nulls defensively (outer join may introduce nulls if any file is missing rows)
     df = df.with_columns([
         pl.col("pred_1hr").fill_null(0.0),
         pl.col("pred_6hr").fill_null(0.0),
@@ -328,6 +336,9 @@ def build_ops_outputs(
         pl.col("label_6hr").fill_null(0.0),
         pl.col("label_12hr").fill_null(0.0),
     ])
+
+    # Ensure stable ordering for time features
+    df = df.sort(["h3_cell", "timestamp"])
 
     # Long-term baseline carries across gaps (nominal behavior memory)
     df = add_long_baseline_features(df, params)
@@ -338,7 +349,7 @@ def build_ops_outputs(
     # Combine into ops_score
     df = add_ops_score(df, params)
 
-    # Save enriched predictions
+    # Save enriched predictions table (ALL columns)
     df.write_parquet(out_enriched_path)
 
     # Save per-hour metrics
@@ -359,7 +370,7 @@ if __name__ == "__main__":
         pred_1hr_path="/data/preds/test_preds_1hr.parquet",
         pred_6hr_path="/data/preds/test_preds_6hr.parquet",
         pred_12hr_path="/data/preds/test_preds_12hr.parquet",
-        out_enriched_path="/data/preds/test_preds_ops.parquet",
+        out_enriched_path="/data/preds/test_preds_ops_full.parquet",
         params=OpsParams(
             roll_mean_win=24,
             roll_std_win=24,
